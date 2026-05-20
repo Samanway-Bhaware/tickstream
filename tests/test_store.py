@@ -62,11 +62,11 @@ def _generate_ticks() -> list[Tick]:
             ts_ns = _DAY1_START_NS + i * _STEP_NS
             price = price_base + Decimal(i % 100)
             ticks.append(
-                Tick(
+                Tick.model_construct(
                     exchange=_EXCHANGE,
                     symbol=symbol,
-                    price=str(price),
-                    size=str(_SIZE),
+                    price=price,
+                    size=_SIZE,
                     side="buy" if i % 2 == 0 else "sell",
                     timestamp_ns=ts_ns,
                     received_ns=ts_ns + 1_000_000,  # 1 ms after exchange ts

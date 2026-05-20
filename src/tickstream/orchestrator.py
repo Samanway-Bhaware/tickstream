@@ -15,6 +15,17 @@ Shutdown sequence
 If the orchestrator's own task is cancelled externally (not via signal) the
 ``CancelledError`` propagates through the TaskGroup, which cancels all
 children, then re-raises; the caller sees a normal ``CancelledError``.
+
+Periodic structured log
+-----------------------
+When a :class:`~tickstream.monitoring.metrics.MetricsRegistry` is supplied,
+the orchestrator emits a ``"pipeline.summary"`` structlog event every
+``log_interval_s`` seconds (default 10 s) that contains:
+
+- ``queue_depth`` – current items in the shared queue
+- ``msgs_per_sec`` – per-exchange raw-frame rate since the last summary
+- ``files_written`` – total Parquet files written (requires *writer* kwarg)
+- ``oldest_batch_age_s`` – age of the oldest in-memory batch (requires *writer*)
 """
 
 from __future__ import annotations
@@ -23,13 +34,20 @@ import asyncio
 import contextlib
 import signal
 from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 import structlog
 
 from tickstream.connectors.base import BaseConnector
 from tickstream.models import Tick
 
+if TYPE_CHECKING:
+    from tickstream.monitoring.metrics import MetricsRegistry
+    from tickstream.storage.parquet_writer import ParquetWriter
+
 log: structlog.BoundLogger = structlog.get_logger(__name__)
+
+_DEFAULT_LOG_INTERVAL_S: float = 10.0
 
 
 class Orchestrator:
@@ -44,6 +62,16 @@ class Orchestrator:
     queue:
         The shared destination queue.  All connectors must already be
         configured to push to this queue.
+    metrics:
+        Optional :class:`~tickstream.monitoring.metrics.MetricsRegistry`.
+        When provided, ``queue_depth`` is sampled and a periodic structured
+        log is emitted every *log_interval_s* seconds.
+    writer:
+        Optional :class:`~tickstream.storage.parquet_writer.ParquetWriter`
+        reference used to include ``files_written`` and ``oldest_batch_age_s``
+        in the periodic log.
+    log_interval_s:
+        How often (in seconds) the periodic summary log fires.
 
     Example
     -------
@@ -64,11 +92,18 @@ class Orchestrator:
         self,
         connectors: Sequence[BaseConnector],
         queue: asyncio.Queue[Tick],
+        *,
+        metrics: MetricsRegistry | None = None,
+        writer: ParquetWriter | None = None,
+        log_interval_s: float = _DEFAULT_LOG_INTERVAL_S,
     ) -> None:
         if not connectors:
             raise ValueError("At least one connector must be provided")
         self._connectors = list(connectors)
         self._queue = queue
+        self._metrics = metrics
+        self._writer = writer
+        self._log_interval_s = log_interval_s
 
     async def run(self) -> None:
         """Start all connectors; block until a stop signal or cancellation.
@@ -89,7 +124,7 @@ class Orchestrator:
             with contextlib.suppress(NotImplementedError, OSError):
                 loop.add_signal_handler(sig, _on_signal)
 
-        connector_tasks: list[asyncio.Task[None]] = []
+        all_tasks: list[asyncio.Task[None]] = []
 
         try:
             async with asyncio.TaskGroup() as tg:
@@ -98,7 +133,14 @@ class Orchestrator:
                         connector.run(),
                         name=f"{type(connector).__name__}-{i}",
                     )
-                    connector_tasks.append(t)
+                    all_tasks.append(t)
+
+                # Periodic summary log (only when metrics are wired in).
+                if self._metrics is not None:
+                    pt = tg.create_task(
+                        self._periodic_task(), name="orchestrator-periodic"
+                    )
+                    all_tasks.append(pt)
 
                 log.info(
                     "orchestrator.started",
@@ -106,13 +148,13 @@ class Orchestrator:
                     connectors=[type(c).__name__ for c in self._connectors],
                 )
 
-                # Block until a stop signal arrives; then cancel all connectors.
+                # Block until a stop signal arrives; then cancel all tasks.
                 # If we're cancelled externally, CancelledError propagates here,
                 # exits the TaskGroup body, and the TaskGroup cancels children.
                 await stop.wait()
 
                 log.info("orchestrator.stopping")
-                for task in connector_tasks:
+                for task in all_tasks:
                     task.cancel()
             # TaskGroup.__aexit__ waits for all tasks to complete before here.
 
@@ -129,3 +171,47 @@ class Orchestrator:
                     loop.remove_signal_handler(sig)
 
         log.info("orchestrator.stopped")
+
+    # ------------------------------------------------------------------
+    # Periodic summary log
+    # ------------------------------------------------------------------
+
+    async def _periodic_task(self) -> None:
+        """Sample queue depth and emit a structured pipeline summary log."""
+        interval = self._log_interval_s
+        while True:
+            try:
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                return
+
+            depth = self._queue.qsize()
+
+            # Update queue-depth gauge.
+            if self._metrics is not None:
+                self._metrics.set_queue_depth(depth)
+                raw_rates = self._metrics.snapshot_recv_rates()
+                msgs_per_sec = {
+                    ex: round(cnt / interval, 1) for ex, cnt in raw_rates.items()
+                }
+            else:
+                msgs_per_sec: dict[str, float] = {}
+
+            files_written: int | None = (
+                self._writer.files_written if self._writer is not None else None
+            )
+            oldest_age: float | None = (
+                self._writer.oldest_batch_age_s
+                if self._writer is not None
+                else None
+            )
+
+            log.info(
+                "pipeline.summary",
+                queue_depth=depth,
+                msgs_per_sec=msgs_per_sec,
+                files_written=files_written,
+                oldest_batch_age_s=(
+                    round(oldest_age, 2) if oldest_age is not None else None
+                ),
+            )

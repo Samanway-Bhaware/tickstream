@@ -1,0 +1,13 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: tickstream-local
+
+scrape_configs:
+  - job_name: tickstream
+    static_configs:
+      - targets:
+          - tickstream:9090
+    scrape_interval: 10s
+    metrics_path: /metrics

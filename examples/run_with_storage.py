@@ -36,11 +36,12 @@ import pyarrow.parquet as pq
 import structlog
 
 from tickstream.config import get_settings
+from tickstream.connectors.base import BaseConnector
 from tickstream.connectors.binance import BinanceConnector
 from tickstream.connectors.coinbase import CoinbaseConnector
-from tickstream.connectors.base import BaseConnector
 from tickstream.logging import configure_logging
 from tickstream.models import Tick
+from tickstream.monitoring.metrics import MetricsRegistry
 from tickstream.orchestrator import Orchestrator
 from tickstream.storage.parquet_writer import ParquetWriter
 
@@ -87,18 +88,26 @@ async def main(
     coinbase_symbols: list[str],
     output_dir: Path,
     duration_s: int,
+    metrics_port: int | None,
 ) -> None:
     settings = get_settings()
     configure_logging(settings)
     log = structlog.get_logger(__name__)
 
+    # Start Prometheus metrics server if a port is configured.
+    metrics: MetricsRegistry | None = None
+    if metrics_port is not None:
+        metrics = MetricsRegistry()
+        metrics.start_http_server(metrics_port)
+        log.info("metrics.started", port=metrics_port)
+
     queue: asyncio.Queue[Tick] = asyncio.Queue(maxsize=200_000)
 
     connectors: list[BaseConnector] = []
     if binance_symbols:
-        connectors.append(BinanceConnector(binance_symbols, queue))
+        connectors.append(BinanceConnector(binance_symbols, queue, metrics=metrics))
     if coinbase_symbols:
-        connectors.append(CoinbaseConnector(coinbase_symbols, queue))
+        connectors.append(CoinbaseConnector(coinbase_symbols, queue, metrics=metrics))
 
     if not connectors:
         print("No connectors configured.  Pass --binance and/or --coinbase.", file=sys.stderr)
@@ -109,6 +118,7 @@ async def main(
         root_dir=output_dir,
         max_batch_size=10_000,
         flush_interval_s=30.0,
+        metrics=metrics,
     )
 
     log.info(
@@ -117,9 +127,10 @@ async def main(
         output_dir=str(output_dir),
         binance=binance_symbols,
         coinbase=coinbase_symbols,
+        metrics_port=metrics_port,
     )
 
-    orch = Orchestrator(connectors, queue)
+    orch = Orchestrator(connectors, queue, metrics=metrics, writer=writer)
     writer_task = asyncio.create_task(writer.run(), name="parquet-writer")
     orch_task = asyncio.create_task(orch.run(), name="orchestrator")
 
@@ -198,6 +209,13 @@ if __name__ == "__main__":
         action="store_true",
         help="Disable Binance connector",
     )
+    parser.add_argument(
+        "--metrics-port",
+        type=int,
+        default=None,
+        metavar="PORT",
+        help="Start Prometheus /metrics server on PORT (default: disabled)",
+    )
     args = parser.parse_args()
 
     binance = [] if args.no_binance else [s.lower() for s in (args.binance or [])]
@@ -208,6 +226,8 @@ if __name__ == "__main__":
         print(f"  Binance : {', '.join(binance)}")
     if coinbase:
         print(f"  Coinbase: {', '.join(coinbase)}")
+    if args.metrics_port:
+        print(f"  Metrics : http://localhost:{args.metrics_port}/metrics")
     print("(Ctrl-C stops early)\n")
 
-    asyncio.run(main(binance, coinbase, args.out, args.seconds))
+    asyncio.run(main(binance, coinbase, args.out, args.seconds, args.metrics_port))

@@ -21,12 +21,15 @@ import argparse
 import asyncio
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from tickstream.connectors.binance import BinanceConnector
-from tickstream.models import Tick
 from tickstream.orchestrator import Orchestrator
 from tickstream.query.store import TickStore
 from tickstream.storage.parquet_writer import ParquetWriter
+
+if TYPE_CHECKING:
+    from tickstream.models import Tick
 
 _DEFAULT_DATA_DIR = Path("tick_data")
 _COLLECT_SECONDS = 30  # short run to gather some data
@@ -78,7 +81,6 @@ def _section(title: str) -> None:
 
 def _run_demo(data_dir: Path) -> None:
     with TickStore(data_dir) as store:
-
         # ── 1. symbols ────────────────────────────────────────────────────
         _section("1. symbols() — available exchange:symbol pairs")
         syms = store.symbols()
@@ -102,7 +104,7 @@ def _run_demo(data_dir: Path) -> None:
         df_trades = store.trades(symbol, start_ns, now_ns, exchange=exchange)
         print(f"  {len(df_trades)} trades in the last 60 s")
         if len(df_trades) > 0:
-            print(df_trades.head(5).to_pandas().to_string(index=False))
+            print(df_trades.head(5))
 
         # ── 3. vwap ───────────────────────────────────────────────────────
         _section(f"3. vwap('{symbol}', last 60 s)")
@@ -121,11 +123,9 @@ def _run_demo(data_dir: Path) -> None:
             import polars as pl
 
             df_display = df_bars.with_columns(
-                (pl.col("bar_start_ns") // 1_000_000_000)
-                .cast(pl.Int64)
-                .alias("bar_start_s")
+                (pl.col("bar_start_ns") // 1_000_000_000).cast(pl.Int64).alias("bar_start_s")
             ).select(["bar_start_s", "open", "high", "low", "close", "volume", "count"])
-            print(df_display.to_pandas().to_string(index=False))
+            print(df_display)
 
         # ── 5. gaps ───────────────────────────────────────────────────────
         _section(f"5. gaps('{symbol}', exchange='{exchange}', max_gap_seconds=5)")
@@ -134,7 +134,7 @@ def _run_demo(data_dir: Path) -> None:
             print("  No gaps detected (good — data is continuous).")
         else:
             print(f"  {len(df_gaps)} gap(s) found:")
-            print(df_gaps.to_pandas().to_string(index=False))
+            print(df_gaps)
 
     print(f"\n{'=' * 60}")
     print("  Demo complete.")
@@ -176,8 +176,7 @@ if __name__ == "__main__":
     else:
         if not data_dir.exists():
             print(
-                f"Data directory {data_dir} not found.  "
-                "Run without --no-collect to populate it.",
+                f"Data directory {data_dir} not found.  Run without --no-collect to populate it.",
                 file=sys.stderr,
             )
             sys.exit(1)

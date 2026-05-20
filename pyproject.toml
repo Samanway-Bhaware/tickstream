@@ -12,6 +12,7 @@ dependencies = [
     "structlog>=24.2",
     "websockets>=12.0",
     "pyarrow>=15.0",
+    "prometheus-client>=0.20",
     "duckdb>=1.0",
     "polars>=1.0",
     "tomli>=2.0; python_version < '3.11'",
@@ -22,6 +23,7 @@ dev = [
     "mypy>=1.10",
     "pytest>=8.2",
     "pytest-asyncio>=0.23",
+    "pytest-xdist>=3.6",
     "ruff>=0.4",
     "pre-commit>=3.7",
 ]
@@ -84,7 +86,11 @@ packages = ["tickstream"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
-addopts = "-v --tb=short"
+addopts = "-v --tb=short -m 'not slow' --durations=10"
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: end-to-end pipeline tests",
+]
 
 # ---------------------------------------------------------------------------
 # coverage (optional, useful with pytest-cov)

@@ -19,12 +19,16 @@ import random
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Sequence
+from typing import TYPE_CHECKING
 
 import structlog
 import websockets
 import websockets.exceptions
 
 from tickstream.models import Tick
+
+if TYPE_CHECKING:
+    from tickstream.monitoring.metrics import MetricsRegistry
 
 log: structlog.BoundLogger = structlog.get_logger(__name__)
 
@@ -53,6 +57,10 @@ class BaseConnector(ABC):
     jitter_factor:
         Upper bound on random jitter as a fraction of the current delay.
         Set to ``0.0`` for deterministic behaviour in tests.
+    metrics:
+        Optional :class:`~tickstream.monitoring.metrics.MetricsRegistry`.
+        When provided, the connector records received/parsed/error/reconnect
+        counters automatically.
     """
 
     def __init__(
@@ -63,6 +71,7 @@ class BaseConnector(ABC):
         initial_backoff: float = _INITIAL_BACKOFF,
         max_backoff: float = _MAX_BACKOFF,
         jitter_factor: float = _JITTER_FACTOR,
+        metrics: MetricsRegistry | None = None,
     ) -> None:
         if not symbols:
             raise ValueError("At least one symbol must be provided")
@@ -71,6 +80,21 @@ class BaseConnector(ABC):
         self._initial_backoff = initial_backoff
         self._max_backoff = max_backoff
         self._jitter_factor = jitter_factor
+        self._metrics = metrics
+
+    # ------------------------------------------------------------------
+    # Exchange identity — subclasses should override for canonical names
+    # ------------------------------------------------------------------
+
+    @property
+    def exchange(self) -> str:
+        """Exchange label used for metric dimensions.
+
+        Defaults to the class name with ``"Connector"`` stripped and
+        lower-cased (e.g. ``BinanceConnector`` → ``"binance"``).
+        Subclasses should override to return a canonical string.
+        """
+        return type(self).__name__.removesuffix("Connector").lower()
 
     # ------------------------------------------------------------------
     # Abstract interface — subclasses must implement all three
@@ -129,6 +153,8 @@ class BaseConnector(ABC):
                     sleep_s=round(sleep_for, 3),
                     symbols=self._symbols,
                 )
+                if self._metrics is not None:
+                    self._metrics.record_reconnect(self.exchange)
                 try:
                     await asyncio.sleep(sleep_for)
                 except asyncio.CancelledError:
@@ -199,9 +225,13 @@ class BaseConnector(ABC):
     def _dispatch(self, raw_message: str | bytes, received_ns: int) -> None:
         """Iterate ``_parse_message``, enqueue results, swallow parse errors."""
         name = type(self).__name__
+        if self._metrics is not None:
+            self._metrics.record_message_received(self.exchange)
         try:
             # _parse_message is a generator; body executes lazily inside this loop.
             for tick in self._parse_message(raw_message, received_ns):
+                if self._metrics is not None:
+                    self._metrics.record_tick_parsed(tick.exchange, tick.symbol)
                 try:
                     self._queue.put_nowait(tick)
                 except asyncio.QueueFull:
@@ -212,6 +242,8 @@ class BaseConnector(ABC):
                         queue_size=self._queue.qsize(),
                     )
         except Exception as exc:
+            if self._metrics is not None:
+                self._metrics.record_parse_error(self.exchange)
             log.warning(
                 "connector.parse_error",
                 connector=name,

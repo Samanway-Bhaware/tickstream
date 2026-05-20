@@ -58,7 +58,7 @@ import calendar
 import json
 from collections.abc import Iterable, Sequence
 from datetime import datetime
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from tickstream.connectors.base import (
     BaseConnector,
@@ -67,6 +67,9 @@ from tickstream.connectors.base import (
     _MAX_BACKOFF,
 )
 from tickstream.models import Tick
+
+if TYPE_CHECKING:
+    from tickstream.monitoring.metrics import MetricsRegistry
 
 _WS_URL: str = "wss://advanced-trade-ws.coinbase.com"
 _CHANNEL: str = "market_trades"
@@ -157,6 +160,7 @@ class CoinbaseConnector(BaseConnector):
         initial_backoff: float = _INITIAL_BACKOFF,
         max_backoff: float = _MAX_BACKOFF,
         jitter_factor: float = _JITTER_FACTOR,
+        metrics: "MetricsRegistry | None" = None,
     ) -> None:
         import asyncio
 
@@ -166,8 +170,13 @@ class CoinbaseConnector(BaseConnector):
             initial_backoff=initial_backoff,
             max_backoff=max_backoff,
             jitter_factor=jitter_factor,
+            metrics=metrics,
         )
         self._ws_url = ws_url
+
+    @property
+    def exchange(self) -> str:
+        return "coinbase"
 
     # ------------------------------------------------------------------
     # BaseConnector interface

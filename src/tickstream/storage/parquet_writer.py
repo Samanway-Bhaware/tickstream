@@ -50,7 +50,7 @@ import structlog
 from tickstream.models import Tick
 
 if TYPE_CHECKING:
-    pass
+    from tickstream.monitoring.metrics import MetricsRegistry
 
 log: structlog.BoundLogger = structlog.get_logger(__name__)
 
@@ -141,11 +141,11 @@ def _ticks_to_table(ticks: list[Tick]) -> pa.Table:
     )
 
 
-def _write_batch_sync(ticks: list[Tick], dir_path: Path) -> Path:
-    """Write *ticks* to a new Parquet file in *dir_path*.
+def _write_table_sync(table: pa.Table, dir_path: Path) -> Path:
+    """Write a PyArrow *table* to a new Parquet file in *dir_path*.
 
     This is a **blocking** function intended to run in a thread-pool
-    executor.  It has no side-effects on any shared mutable state.
+    executor.
 
     Returns the final (post-rename) :class:`Path`.
     """
@@ -154,7 +154,6 @@ def _write_batch_sync(ticks: list[Tick], dir_path: Path) -> Path:
     final_path = dir_path / filename
     tmp_path = final_path.with_name(final_path.name + ".tmp")
 
-    table = _ticks_to_table(ticks)
     pq.write_table(
         table,
         str(tmp_path),
@@ -164,6 +163,18 @@ def _write_batch_sync(ticks: list[Tick], dir_path: Path) -> Path:
     # Atomic rename — on POSIX this is a single syscall; on Windows it replaces.
     tmp_path.replace(final_path)
     return final_path
+
+
+def _write_batch_sync(ticks: list[Tick], dir_path: Path) -> Path:
+    """Write *ticks* to a new Parquet file in *dir_path*.
+
+    This is a **blocking** function intended to run in a thread-pool
+    executor.  It has no side-effects on any shared mutable state.
+
+    Returns the final (post-rename) :class:`Path`.
+    """
+    table = _ticks_to_table(ticks)
+    return _write_table_sync(table, dir_path)
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +222,8 @@ class ParquetWriter:
         max_batch_size: int = 10_000,
         flush_interval_s: float = 30.0,
         executor: concurrent.futures.Executor | None = None,
+        metrics: MetricsRegistry | None = None,
+        fsync: bool = True,
     ) -> None:
         self._queue = queue
         self._root = Path(root_dir)
@@ -219,6 +232,8 @@ class ParquetWriter:
         self._executor = executor or concurrent.futures.ThreadPoolExecutor(
             max_workers=4, thread_name_prefix="parquet-writer"
         )
+        self._metrics = metrics
+        self._fsync = fsync
 
         self._batches: dict[PartitionKey, _Batch] = {}
         self._files_written: int = 0
@@ -231,6 +246,34 @@ class ParquetWriter:
     def files_written(self) -> int:
         """Total number of Parquet files written since the writer started."""
         return self._files_written
+
+    @property
+    def oldest_batch_age_s(self) -> float | None:
+        """Age in seconds of the oldest in-memory batch, or ``None`` if no open batches."""
+        if not self._batches:
+            return None
+        now = time.monotonic()
+        return now - min(batch.opened_at for batch in self._batches.values())
+
+    async def write_table(
+        self,
+        table: pa.Table,
+        exchange: str,
+        symbol: str,
+        date: str,
+    ) -> Path:
+        """Write a PyArrow Table directly to disk asynchronously.
+
+        Useful for bulk data ingestion or loading tests bypassing model
+        parsing overhead.
+        """
+        dir_path = _partition_dir(self._root, exchange, symbol, date)
+        loop = asyncio.get_running_loop()
+        path = await loop.run_in_executor(
+            self._executor, _write_table_sync, table, dir_path
+        )
+        self._files_written += 1
+        return path
 
     async def run(self) -> None:
         """Consume ticks from the queue and flush batches to disk.
@@ -329,10 +372,16 @@ class ParquetWriter:
         dir_path = _partition_dir(self._root, exchange, symbol, date)
         n = len(batch.rows)
 
+        t0 = time.monotonic()
         loop = asyncio.get_running_loop()
         path = await loop.run_in_executor(
             self._executor, _write_batch_sync, batch.rows, dir_path
         )
+        latency = time.monotonic() - t0
+
+        if self._metrics is not None:
+            self._metrics.record_ticks_written(exchange, symbol, n)
+            self._metrics.observe_write_latency(latency)
 
         self._files_written += 1
         log.info(
@@ -343,4 +392,5 @@ class ParquetWriter:
             n_ticks=n,
             path=str(path),
             files_total=self._files_written,
+            write_latency_s=round(latency, 4),
         )

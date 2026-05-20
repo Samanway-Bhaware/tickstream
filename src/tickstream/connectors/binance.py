@@ -32,6 +32,8 @@ import json
 from collections.abc import Iterable, Sequence
 from typing import Any, Literal
 
+from typing import TYPE_CHECKING
+
 from tickstream.connectors.base import (
     BaseConnector,
     _INITIAL_BACKOFF,
@@ -39,6 +41,9 @@ from tickstream.connectors.base import (
     _MAX_BACKOFF,
 )
 from tickstream.models import Tick
+
+if TYPE_CHECKING:
+    from tickstream.monitoring.metrics import MetricsRegistry
 
 _WS_BASE: str = "wss://stream.binance.com:9443"
 
@@ -98,6 +103,7 @@ class BinanceConnector(BaseConnector):
         initial_backoff: float = _INITIAL_BACKOFF,
         max_backoff: float = _MAX_BACKOFF,
         jitter_factor: float = _JITTER_FACTOR,
+        metrics: "MetricsRegistry | None" = None,
     ) -> None:
         import asyncio
 
@@ -107,8 +113,13 @@ class BinanceConnector(BaseConnector):
             initial_backoff=initial_backoff,
             max_backoff=max_backoff,
             jitter_factor=jitter_factor,
+            metrics=metrics,
         )
         self._ws_base = ws_base
+
+    @property
+    def exchange(self) -> str:
+        return "binance"
 
     # ------------------------------------------------------------------
     # BaseConnector interface
