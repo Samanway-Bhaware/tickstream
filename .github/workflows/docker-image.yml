@@ -15,7 +15,7 @@ jobs:
   build-and-push:
     name: Build & Push
     runs-on: ubuntu-latest
-    permissions:
+    permissions: 
       contents: read
       packages: write
 
