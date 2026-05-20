@@ -1,0 +1,83 @@
+name: Docker Image
+
+on:
+  push:
+    branches: ["main"]
+    tags: ["v*.*.*"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    name: Build & Push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      # ── 1. Source ──────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Buildx (multi-platform builder) ────────────────────────────────
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ── 3. Registry login (skipped on fork PRs) ───────────────────────────
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── 4. Image metadata (tags + labels) ─────────────────────────────────
+      #
+      # Tags produced:
+      #   push to main   → ghcr.io/<owner>/tickstream:main
+      #                    ghcr.io/<owner>/tickstream:sha-<short-sha>
+      #   push of v1.2.3 → ghcr.io/<owner>/tickstream:1.2.3
+      #                    ghcr.io/<owner>/tickstream:1.2
+      #                    ghcr.io/<owner>/tickstream:1
+      #                    ghcr.io/<owner>/tickstream:latest
+      #   pull request   → ghcr.io/<owner>/tickstream:pr-<number>  (not pushed)
+      #
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr,prefix=pr-
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,prefix=sha-,format=short
+
+      # ── 5. Build (and push on non-PR events) ──────────────────────────────
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Reuse layer cache from the registry to speed up rebuilds.
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
+          cache-to: >-
+            ${{ github.event_name != 'pull_request' &&
+                format('type=registry,ref={0}/{1}:buildcache,mode=max', env.REGISTRY, env.IMAGE_NAME)
+                || '' }}
+
+      # ── 6. Print image digest for audit trail ─────────────────────────────
+      - name: Image digest
+        if: github.event_name != 'pull_request'
+        run: echo "Pushed ${{ steps.meta.outputs.tags }} — digest ${{ steps.build-push.outputs.digest }}"
